@@ -27,6 +27,7 @@ from tensorflow.python.ops import string_ops
 from tensorflow_text.python.ops import regex_split_ops
 from tensorflow_text.python.ops.normalize_ops import case_fold_utf8
 from tensorflow_text.python.ops.normalize_ops import normalize_utf8
+from tensorflow_text.python.ops.tokenization import Detokenizer
 from tensorflow_text.python.ops.tokenization import TokenizerWithOffsets
 from tensorflow_text.python.ops.wordpiece_tokenizer import WordpieceTokenizer
 
@@ -137,7 +138,7 @@ class BasicTokenizer(TokenizerWithOffsets):
         "BertBasicTokenizer")
 
 
-class BertTokenizer(TokenizerWithOffsets):
+class BertTokenizer(TokenizerWithOffsets, Detokenizer):
   r"""Tokenizer used for BERT.
 
     This tokenizer applies an end-to-end, text string to wordpiece tokenization.
@@ -224,3 +225,17 @@ class BertTokenizer(TokenizerWithOffsets):
     """
     tokens = self._basic_tokenizer.tokenize(text_input)
     return self._wordpiece_tokenizer.tokenize(tokens)
+
+  def detokenize(self, token_ids):
+    """Convert a Tensor or RaggedTensor of wordpiece IDs to string-words.
+
+    Args:
+      token_ids: A `RaggedTensor` or `Tensor` with an int dtype. * A `Tensor`
+        should have dimensions `(batch, padded-wordpiece)`. * A `RaggedTensor`
+        sould have dimensions `(batch, ragged-wordpiece)` or `(batch,
+        ragged-words, ragged-wordpiece)`.
+
+    Returns:
+      A `RaggedTensor` with dtype `string` and shape `(batch, ragged-words)`.
+    """
+    return self._wordpiece_tokenizer.detokenize(token_ids)

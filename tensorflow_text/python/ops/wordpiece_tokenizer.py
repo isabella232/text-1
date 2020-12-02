@@ -19,15 +19,24 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import re
+
 from tensorflow.python.compat import compat
 from tensorflow.python.eager import monitoring
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import check_ops
+from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import lookup_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import sort_ops
+from tensorflow.python.ops import string_ops
+from tensorflow.python.ops import variables
+from tensorflow.python.ops.ragged import ragged_string_ops
 from tensorflow.python.ops.ragged import ragged_tensor
 from tensorflow.python.ops.ragged.ragged_tensor import RaggedTensor
+from tensorflow_text.python.ops.tokenization import Detokenizer
 from tensorflow_text.python.ops.tokenization import TokenizerWithOffsets
 
 # pylint: disable=g-bad-import-order
@@ -40,7 +49,7 @@ _tf_text_wordpiece_tokenizer_op_create_counter = monitoring.Counter(
     'Counter for number of WordpieceTokenizers created in Python.')
 
 
-class WordpieceTokenizer(TokenizerWithOffsets):
+class WordpieceTokenizer(TokenizerWithOffsets, Detokenizer):
   """Tokenizes a tensor of UTF-8 string tokens into subword pieces."""
 
   def __init__(self,
@@ -98,6 +107,30 @@ class WordpieceTokenizer(TokenizerWithOffsets):
     self._unknown_token = unknown_token if unknown_token else '[UNK]'
     self._use_unknown_token = True if unknown_token else False
     self._split_unknown_characters = split_unknown_characters
+    self._can_detokenize = None
+
+  def _get_vocab_and_ids(self):
+    export = getattr(self._vocab_lookup_table, 'export', None)
+    if export is None:
+      table = getattr(self._vocab_lookup_table, '_table')
+      export = table.export
+
+    vocab, ids = export()  # pylint: disable=protected-access
+
+    # `.export` doesn't set the shapes.
+    vocab = check_ops.ensure_shape(vocab, [
+        None,
+    ])
+    ids = check_ops.ensure_shape(ids, [
+        None,
+    ])
+
+    order = sort_ops.argsort(ids)
+
+    ids = array_ops.gather(ids, order)
+    vocab = array_ops.gather(vocab, order)
+
+    return vocab, ids
 
   def tokenize(self, input):  # pylint: disable=redefined-builtin
     """Tokenizes a tensor of UTF-8 string tokens further into subword tokens.
@@ -218,3 +251,61 @@ class WordpieceTokenizer(TokenizerWithOffsets):
       ends = from_row_partition(ends, row_splits, validate=False)
 
       return wordpieces, starts, ends
+
+  def detokenize(self, token_ids):
+    """Convert a Tensor or RaggedTensor of wordpiece IDs to string-words.
+
+    Args:
+      token_ids: A `RaggedTensor` or `Tensor` with an int dtype. * A `Tensor`
+        should have dimensions `(batch, padded-wordpiece)`. * A `RaggedTensor`
+        sould have dimensions `(batch, ragged-wordpiece)` or `(batch,
+        ragged-words, ragged-wordpiece)`.
+
+    Returns:
+      A `RaggedTensor` with dtype `string` and shape `(batch, ragged-words)`.
+    """
+    vocab, ids = self._get_vocab_and_ids()
+
+    if self._can_detokenize is None:
+      def can_detokenize():
+        # Determine if the vocabulary table can be used in the `detokenize`
+        # method. It should if the indices aren't dense on `[0, vocab_size)`
+        first_is_zero = math_ops.equal(ids[0], 0)
+
+        steps = ids[1:] - ids[:-1]
+        all_one_step = math_ops.reduce_all(math_ops.equal(steps, 1))
+        return first_is_zero & all_one_step
+
+      self._can_detokenize = variables.Variable(can_detokenize)
+
+    check = control_flow_ops.Assert(
+        self._can_detokenize,
+        data=[('`detokenize` only works with vocabulary tables where the '
+               'indices are dense on the interval `[0, vocab_size)`')])
+
+    with ops.control_dependencies([check]):
+      token_ids = math_ops.minimum(
+          token_ids,
+          # Limit the OOV buckets to a single index.
+          math_ops.cast(array_ops.size(vocab), token_ids.dtype))
+    # Add the unknown token at that index.
+    vocab = array_ops.concat([vocab, [self._unknown_token]], axis=0)
+
+    # Lookup the text tokens and join them along the innermost axis.
+    txt_tokens = array_ops.gather(vocab, token_ids)
+    words = string_ops.reduce_join_v2(txt_tokens, axis=-1, separator=' ')
+
+    # Collapse " ##" in all strings to make words.
+    # If `token_ids` has a `subword` axis then each item in `words` will be
+    # a word. If there was no `subword` axis then `words` contains
+    # space-separated words
+    words = string_ops.regex_replace(words,
+                                     ' ' + re.escape(self._suffix_indicator),
+                                     '')
+
+    if not isinstance(token_ids, RaggedTensor) or token_ids.ragged_rank < 2:
+      # Drop leading and trailing whitespace.
+      words = string_ops.regex_replace(words, '^ +| +$', '')
+      # Split the space-separated words into a ragged-words axis.
+      words = ragged_string_ops.string_split_v2(words, sep=' ')
+    return words
